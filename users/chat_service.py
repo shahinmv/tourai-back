@@ -176,6 +176,41 @@ def search_tours_by_meal_plan(meal_plan: str) -> List[Dict]:
         print(f"   Error: {str(e)}")
         return []
 
+@tool
+def get_tour_details_by_ids(tour_ids: List[int]) -> List[Dict]:
+    """Get detailed information about specific tours by their IDs. Use this when users ask about specific tours from previous recommendations."""
+    print(f"📋 TOOL CALLED: get_tour_details_by_ids")
+    print(f"   Parameters: tour_ids={tour_ids}")
+    
+    try:
+        tours = Tour.objects.filter(is_active=True, id__in=tour_ids)
+        result = []
+        
+        for tour in tours:
+            result.append({
+                'id': tour.id,
+                'title': tour.title,
+                'destination': tour.destination,
+                'hotel_name': tour.hotel_name,
+                'price': float(tour.price),
+                'start_date': tour.start_date.strftime('%Y-%m-%d'),
+                'end_date': tour.end_date.strftime('%Y-%m-%d'),
+                'visa_required': tour.visa_required,
+                'meal_plan': tour.get_meal_plan_display(),
+                'flight_type': tour.get_flight_type_display(),
+                'agent_name': tour.agent.get_full_name() or tour.agent.username,
+                'company_name': tour.agent.tour_company.name if tour.agent.tour_company else 'Independent Agent',
+                'description': tour.description[:300] + '...' if len(tour.description) > 300 else tour.description
+            })
+        
+        print(f"   Results: Found {len(result)} tours with detailed information")
+        for tour in result:
+            print(f"     - {tour['title']} ({tour['destination']}) - Visa: {tour['visa_required']}")
+        return result
+    except Exception as e:
+        print(f"   Error: {str(e)}")
+        return []
+
 def _serialize_tours_for_llm(tours) -> List[Dict]:
     """Serialize tour objects with minimal data for LLM - prevents detailed responses"""
     tours_data = []
@@ -221,7 +256,7 @@ class TourRecommendationService:
         # Initialize the LLM
         try:
             self.llm = ChatOpenAI(
-                model="gpt-4o-mini",
+                model="gpt-4.1-mini",
                 temperature=0.1,
                 api_key=os.getenv("OPENAI_API_KEY")
             )
@@ -234,7 +269,8 @@ class TourRecommendationService:
                 get_all_available_destinations,
                 search_tours_by_visa_requirement,
                 search_tours_by_date_range,
-                search_tours_by_meal_plan
+                search_tours_by_meal_plan,
+                get_tour_details_by_ids
             ]
             
             # Create agent
@@ -243,8 +279,9 @@ class TourRecommendationService:
 IMPORTANT CONVERSATION RULES:
 1. For greetings like "Hi", "Hello", "Good morning" - respond conversationally WITHOUT searching for tours
 2. ALWAYS search for tours when users mention travel interests, activities, or destinations
-3. Be helpful by finding actual tour options, don't just give general advice
-4. Keep responses conversational and helpful
+3. For follow-up questions about previously recommended tours, use get_tour_details_by_ids tool first
+4. Be helpful by finding actual tour options, don't just give general advice
+5. Keep responses conversational and helpful
 
 MANDATORY TOOL USAGE RULES:
 - Use search_tours_by_destination for ANY location mentioned (e.g., "Japan", "Europe", "Thailand")  
@@ -254,17 +291,24 @@ MANDATORY TOOL USAGE RULES:
 - Use search_tours_by_date_range when users mention specific dates or travel periods ("in March", "next summer", "2024-05-15")
 - Use search_tours_by_meal_plan when users mention meal preferences ("all inclusive", "breakfast included", "full board", "half board")
 - Use get_all_available_destinations when users ask about available options
+- Use get_tour_details_by_ids when users ask follow-up questions about specific tours (you'll be given the tour IDs in CONTEXT)
 - Always search for tours when users mention specific travel requests
+
+FOLLOW-UP QUESTION HANDLING:
+- When CONTEXT mentions previously recommended tours, ALWAYS use get_tour_details_by_ids first with the provided IDs
+- Answer questions about specific tour details like visa requirements, hotels, meal plans, dates, etc.
+- Be specific and helpful in your answers based on the actual tour data
 
 RESPONSE FORMAT:
 - Be enthusiastic and conversational when finding new tours
-- Answer user questions helpfully and naturally
+- Answer user questions helpfully and naturally based on actual tour data
 - Keep all responses brief and natural
 - Tour details will be shown separately in visual cards
 
 EXAMPLE RESPONSES:
 "Excellent! I found some fantastic adventure tours that would be perfect for you!"
 "Great! I discovered some amazing cultural tours in Japan that would be perfect!"
+"Yes, that Japan tour does require a visa. It's a 7-day cultural experience in Tokyo."
 
 The system will automatically display tour details in cards - you focus on conversation!"""
 
@@ -301,9 +345,86 @@ The system will automatically display tour details in cards - you focus on conve
         tours = Tour.objects.filter(is_active=True)
         return _serialize_tours_for_llm(tours)
     
-    def _get_mock_response(self, user_query, tours_data, chat_history=None):
+    def _get_mock_response(self, user_query, tours_data, chat_history=None, context_info=None):
         """Provide a mock response when OpenAI is not available"""
         query_lower = user_query.lower().strip()
+        
+        # Handle follow-up questions with context
+        if context_info and context_info['has_context']:
+            # Get detailed information about the recommended tours
+            try:
+                from .models import Tour
+                tours = Tour.objects.filter(id__in=context_info['recommended_tour_ids'], is_active=True)
+                
+                # Generate contextual responses based on the question
+                if 'visa' in query_lower:
+                    visa_tours = [(t.title, t.visa_required, t.destination) for t in tours]
+                    if len(visa_tours) == 1:
+                        tour_name, visa_req, dest = visa_tours[0]
+                        response = f"{'Yes' if visa_req else 'No'}, the {tour_name} tour in {dest} {'requires' if visa_req else 'does not require'} a visa."
+                    else:
+                        visa_info = []
+                        for tour_name, visa_req, dest in visa_tours:
+                            status = 'requires' if visa_req else 'does not require'
+                            visa_info.append(f"{tour_name} ({dest}) {status} a visa")
+                        response = f"Here's the visa information: {'; '.join(visa_info)}."
+                    return {'response': response, 'recommended_tours': []}
+                
+                elif any(word in query_lower for word in ['price', 'cost', 'how much']):
+                    price_tours = [(t.title, t.formatted_price, t.destination) for t in tours]
+                    if len(price_tours) == 1:
+                        tour_name, price, dest = price_tours[0]
+                        response = f"The {tour_name} tour in {dest} costs {price}."
+                    else:
+                        price_info = []
+                        for tour_name, price, dest in price_tours:
+                            price_info.append(f"{tour_name} ({dest}): {price}")
+                        response = f"Here are the prices: {'; '.join(price_info)}."
+                    return {'response': response, 'recommended_tours': []}
+                
+                elif 'hotel' in query_lower:
+                    hotel_tours = [(t.title, t.hotel_name, t.destination) for t in tours]
+                    if len(hotel_tours) == 1:
+                        tour_name, hotel, dest = hotel_tours[0]
+                        response = f"The {tour_name} tour in {dest} includes accommodation at {hotel}." if hotel else f"The {tour_name} tour in {dest} doesn't specify a hotel name."
+                    else:
+                        hotel_info = []
+                        for tour_name, hotel, dest in hotel_tours:
+                            hotel_info.append(f"{tour_name} ({dest}): {hotel if hotel else 'Hotel not specified'}")
+                        response = f"Here are the hotel details: {'; '.join(hotel_info)}."
+                    return {'response': response, 'recommended_tours': []}
+                
+                elif 'meal' in query_lower:
+                    meal_tours = [(t.title, t.get_meal_plan_display(), t.destination) for t in tours]
+                    if len(meal_tours) == 1:
+                        tour_name, meal_plan, dest = meal_tours[0]
+                        response = f"The {tour_name} tour in {dest} includes {meal_plan}."
+                    else:
+                        meal_info = []
+                        for tour_name, meal_plan, dest in meal_tours:
+                            meal_info.append(f"{tour_name} ({dest}): {meal_plan}")
+                        response = f"Here are the meal plans: {'; '.join(meal_info)}."
+                    return {'response': response, 'recommended_tours': []}
+                
+                elif any(word in query_lower for word in ['date', 'when', 'start', 'end']):
+                    date_tours = [(t.title, t.start_date.strftime('%Y-%m-%d'), t.end_date.strftime('%Y-%m-%d'), t.destination) for t in tours]
+                    if len(date_tours) == 1:
+                        tour_name, start_date, end_date, dest = date_tours[0]
+                        response = f"The {tour_name} tour in {dest} runs from {start_date} to {end_date}."
+                    else:
+                        date_info = []
+                        for tour_name, start_date, end_date, dest in date_tours:
+                            date_info.append(f"{tour_name} ({dest}): {start_date} to {end_date}")
+                        response = f"Here are the tour dates: {'; '.join(date_info)}."
+                    return {'response': response, 'recommended_tours': []}
+                
+                # Generic response for other follow-up questions
+                tour_names = [f"{t.title} ({t.destination})" for t in tours]
+                response = f"I can provide more details about {', '.join(tour_names)}. What specific information would you like to know?"
+                return {'response': response, 'recommended_tours': []}
+                
+            except Exception as e:
+                print(f"Error handling context: {e}")
         
         # Simple chat history awareness without tour context parsing
         if chat_history:
@@ -395,23 +516,33 @@ The system will automatically display tour details in cards - you focus on conve
         }
 
 
-    def recommend_tours(self, user_query, chat_history=None):
+    def recommend_tours(self, user_query, chat_history=None, conversation=None):
         """Use agent with tools to analyze user query and recommend suitable tours"""
         print(f"\n🤖 NEW CHAT REQUEST")
         print(f"   User Query: '{user_query}'")
         print(f"   Chat History: {len(chat_history) if chat_history else 0} previous messages")
         print(f"   Using Mock Response: {self.use_mock}")
         
+        # Extract context from recent messages for follow-up questions
+        context_info = self._extract_conversation_context(conversation, chat_history, user_query)
+        
         # Use mock response if OpenAI is not available
         if self.use_mock:
             print(f"   → Using mock response system")
             tours_data = self.get_all_tours_data()
-            return self._get_mock_response(user_query, tours_data, chat_history)
+            return self._get_mock_response(user_query, tours_data, chat_history, context_info)
         
         try:
             print(f"   → Using LangChain agent with tools")
             # Prepare input with chat history if available
             agent_input = {"input": user_query}
+            
+            # Add context information to the query for follow-up questions
+            if context_info['has_context']:
+                enhanced_query = f"{user_query}\n\nCONTEXT: {context_info['context_message']}"
+                agent_input["input"] = enhanced_query
+                print(f"   → Enhanced query with context: {context_info['context_message']}")
+            
             if chat_history:
                 # Convert chat history to proper format for the agent
                 from langchain.schema import HumanMessage, AIMessage
@@ -443,7 +574,7 @@ The system will automatically display tour details in cards - you focus on conve
             print(f"   → Falling back to mock response")
             # Fallback to mock response if agent fails
             tours_data = self.get_all_tours_data()
-            return self._get_mock_response(user_query, tours_data, chat_history)
+            return self._get_mock_response(user_query, tours_data, chat_history, context_info)
     
     def _extract_tours_from_agent_response(self, agent_result):
         """Extract tour IDs from agent's intermediate steps and return full tour data for frontend"""
@@ -470,6 +601,51 @@ The system will automatically display tour details in cards - you focus on conve
             return _serialize_tours_for_frontend(tours)
         
         return []
+    
+    def _extract_conversation_context(self, conversation, chat_history, user_query):
+        """Extract context from recent conversation for follow-up questions"""
+        context_info = {
+            'has_context': False,
+            'context_message': '',
+            'recommended_tour_ids': []
+        }
+        
+        # Check if this looks like a follow-up question
+        follow_up_keywords = [
+            'visa', 'require', 'need', 'this tour', 'these tours', 'that tour', 'those tours',
+            'price', 'cost', 'hotel', 'meal', 'flight', 'date', 'when', 'where', 'how much',
+            'it', 'them', 'that', 'this', 'what about', 'does', 'is', 'are'
+        ]
+        
+        query_lower = user_query.lower()
+        is_follow_up = any(keyword in query_lower for keyword in follow_up_keywords)
+        
+        if is_follow_up and conversation:
+            try:
+                # Get the most recent AI message that has recommended tours
+                from .models import ChatMessage
+                recent_ai_message = ChatMessage.objects.filter(
+                    conversation=conversation,
+                    sender='ai'
+                ).prefetch_related('recommended_tours').order_by('-created_at').first()
+                
+                if recent_ai_message and recent_ai_message.recommended_tours.exists():
+                    recommended_tours = recent_ai_message.recommended_tours.all()
+                    tour_ids = [tour.id for tour in recommended_tours]
+                    tour_names = [f"{tour.title} ({tour.destination})" for tour in recommended_tours]
+                    
+                    context_info.update({
+                        'has_context': True,
+                        'context_message': f"User is asking about these previously recommended tours: {', '.join(tour_names)}. Use get_tour_details_by_ids tool with IDs: {tour_ids}",
+                        'recommended_tour_ids': tour_ids
+                    })
+                    
+                    print(f"   🔄 Follow-up question detected for {len(tour_ids)} tours: {tour_names}")
+                    
+            except Exception as e:
+                print(f"   ❌ Error extracting context: {e}")
+        
+        return context_info
     
     def _extract_recommended_tours(self, llm_response, tours_data):
         """Extract tour IDs mentioned in the LLM response"""

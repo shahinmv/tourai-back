@@ -702,7 +702,7 @@ def chat_with_ai(request):
             for i, msg in enumerate(chat_history):
                 print(f"  {i+1}. {msg[:100]}...")
         
-        result = recommendation_service.recommend_tours(user_message, chat_history=chat_history)
+        result = recommendation_service.recommend_tours(user_message, chat_history=chat_history, conversation=conversation)
         
         # Save AI response and recommended tours for authenticated users
         ai_message = None
