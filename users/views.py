@@ -245,6 +245,11 @@ class TourPagination(PageNumberPagination):
     page_size = 6
     page_size_query_param = 'page_size'
     max_page_size = 100
+    
+    def get_paginated_response(self, data):
+        print(f"DEBUG: Pagination - Total count: {self.page.paginator.count}, Current page: {self.page.number}, Page size: {self.page.paginator.per_page}")
+        print(f"DEBUG: Pagination - Items on this page: {len(data)}")
+        return super().get_paginated_response(data)
 
 
 class AgentTourPermission:
@@ -274,14 +279,11 @@ class TourListCreateView(generics.ListCreateAPIView):
     
     def get_queryset(self):
         user = self.request.user
+        print(f"DEBUG: get_queryset called for user: {user} (authenticated: {user.is_authenticated}, type: {getattr(user, 'user_type', 'anonymous')})")
         
-        # Base queryset based on user type
-        if user.is_authenticated and user.user_type == 'agent':
-            # Agents can only see their own active tours
-            queryset = Tour.objects.filter(agent=user, is_active=True)
-        else:
-            # Regular users and unauthenticated users can see all active tours
-            queryset = Tour.objects.filter(is_active=True)
+        # Base queryset - Everyone can see all active tours on the Discover page
+        queryset = Tour.objects.filter(is_active=True)
+        print(f"DEBUG: Base active tours count (everyone sees all): {queryset.count()}")
         
         # Apply search and filters
         search = self.request.query_params.get('search', '').strip()
@@ -290,6 +292,11 @@ class TourListCreateView(generics.ListCreateAPIView):
         date_to = self.request.query_params.get('date_to', '').strip()
         min_price = self.request.query_params.get('min_price', '').strip()
         max_price = self.request.query_params.get('max_price', '').strip()
+        visa_required = self.request.query_params.get('visa_required', '').strip()
+        meal_plan = self.request.query_params.get('meal_plan', '').strip()
+        flight_type = self.request.query_params.get('flight_type', '').strip()
+        
+        print(f"DEBUG: Query parameters - search: '{search}', destination: '{destination}', min_price: '{min_price}', max_price: '{max_price}', visa_required: '{visa_required}', meal_plan: '{meal_plan}', flight_type: '{flight_type}'")
         
         # Keyword search across title, description, and destination
         if search:
@@ -300,10 +307,12 @@ class TourListCreateView(generics.ListCreateAPIView):
                 Q(destination__icontains=search) |
                 Q(hotel_name__icontains=search)
             )
+            print(f"DEBUG: After search filter: {queryset.count()} tours")
         
         # Filter by destination
         if destination:
             queryset = queryset.filter(destination__iexact=destination)
+            print(f"DEBUG: After destination filter: {queryset.count()} tours")
         
         # Filter by date range
         if date_from:
@@ -327,6 +336,7 @@ class TourListCreateView(generics.ListCreateAPIView):
             try:
                 min_price_decimal = float(min_price)
                 queryset = queryset.filter(price__gte=min_price_decimal)
+                print(f"DEBUG: After min_price filter: {queryset.count()} tours")
             except ValueError:
                 pass  # Invalid price format, ignore filter
         
@@ -334,10 +344,28 @@ class TourListCreateView(generics.ListCreateAPIView):
             try:
                 max_price_decimal = float(max_price)
                 queryset = queryset.filter(price__lte=max_price_decimal)
+                print(f"DEBUG: After max_price filter: {queryset.count()} tours")
             except ValueError:
                 pass  # Invalid price format, ignore filter
         
-        return queryset.order_by('-created_at')
+        # Filter by visa required
+        if visa_required and visa_required.lower() == 'true':
+            queryset = queryset.filter(visa_required=True)
+            print(f"DEBUG: After visa_required filter: {queryset.count()} tours")
+        
+        # Filter by meal plan
+        if meal_plan:
+            queryset = queryset.filter(meal_plan=meal_plan)
+            print(f"DEBUG: After meal_plan filter: {queryset.count()} tours")
+        
+        # Filter by flight type
+        if flight_type:
+            queryset = queryset.filter(flight_type=flight_type)
+            print(f"DEBUG: After flight_type filter: {queryset.count()} tours")
+        
+        final_queryset = queryset.order_by('-created_at')
+        print(f"DEBUG: Final queryset count (after all filters): {final_queryset.count()} tours")
+        return final_queryset
     
     def perform_create(self, serializer):
         # Only agents can create tours
